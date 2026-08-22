@@ -1,15 +1,45 @@
-import json, glob
-from pathlib import Path
-from argparse import ArgumentParser
-from struct import Struct
-from io import BytesIO
+import glob
 import xml.etree.ElementTree as ET
+from argparse import ArgumentParser
+from collections.abc import Iterator
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from struct import Struct
 
 FBFileHeader = Struct(
     '128s' # file path
     '64s' # file type
     'I' # file size
 )
+
+
+@dataclass(frozen=True)
+class FBEntry:
+    file_path: str
+    file_type: str
+    data: bytes
+
+
+def iter_entries(fb_data: bytes) -> Iterator[FBEntry]:
+    """Yield every FB entry in order, including duplicate member paths."""
+    with BytesIO(fb_data) as fb_file:
+        while file_header := fb_file.read(FBFileHeader.size):
+            if len(file_header) != FBFileHeader.size:
+                raise ValueError(
+                    f'truncated FB entry header: {len(file_header)} of '
+                    f'{FBFileHeader.size} bytes'
+                )
+            file_path, file_type, file_size = FBFileHeader.unpack(file_header)
+            file_path = file_path.decode().split('\x00', 1)[0]
+            file_type = file_type.decode().split('\x00', 1)[0]
+            file_data = fb_file.read(file_size)
+            if len(file_data) != file_size:
+                raise ValueError(
+                    f'truncated FB entry {file_path!r}: {len(file_data)} of '
+                    f'{file_size} bytes'
+                )
+            yield FBEntry(file_path, file_type, file_data)
 
 XML_F = ['xml', 'eng', 'fre', 'ger', 'ita', 'spa', 'rus', 'pol']
 XML_Formats = []
@@ -52,25 +82,18 @@ Known_Formats = {
 
 def decompile(fb_path: Path, output_path: Path):
     fb_data = fb_path.read_bytes()
+    entries = ET.Element('packagedef')
 
-    with BytesIO(fb_data) as fb_file:
-        entries = ET.Element('packagedef')
+    for entry in iter_entries(fb_data):
+        child = ET.SubElement(entries, entry.file_type)
+        #inner text: child.text = str(file_path)
+        child.set('filename', entry.file_path) #attribute
+        file_path = output_path.parent / output_path.stem / entry.file_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(entry.data)
 
-        while (file_header := fb_file.read(FBFileHeader.size)):
-            file_path, file_type, file_size = FBFileHeader.unpack(file_header)
-            file_path = file_path.decode().split('\x00', 1)[0]
-            file_type = file_type.decode().split('\x00', 1)[0]
-            file_data = fb_file.read(file_size)
-
-            child = ET.SubElement(entries, file_type)
-            #inner text: child.text = str(file_path)
-            child.set('filename', file_path) #attribute
-            file_path = output_path.parent / output_path.stem / file_path
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_bytes(file_data)
-
-        ET.indent(entries, ' ' * 4)
-        ET.ElementTree(entries).write(output_path, encoding='utf-8')
+    ET.indent(entries, ' ' * 4)
+    ET.ElementTree(entries).write(output_path, encoding='utf-8')
 
 def compile(xml_path: Path, output_path: Path):
     data = ET.parse(xml_path)
@@ -114,7 +137,7 @@ def rebuild(xml_path: Path, output_path: Path):
                 e = p.suffix.lower()
                 if e in XML_Formats: e = '.xmlb'
                 type_string = folder + e
-                file_type = Known_Formats[type_string] if type_string in Known_Formats else Known_Formats[e] if e in Known_Formats else 'unknown'
+                file_type = Known_Formats[type_string] if type_string in Known_Formats else Known_Formats.get(e, 'unknown')
             file_data = p.read_bytes()
             fb_file_header = FBFileHeader.pack(file_path.encode(), file_type.encode(), len(file_data))
 
